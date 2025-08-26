@@ -25,7 +25,7 @@ fksfold fold input.fasta output_folder
 ### Pythonic inference
 
 ```shell
-python examples/predict_structure_fks.py
+python examples/run_save_traj.py
 ```
 
 

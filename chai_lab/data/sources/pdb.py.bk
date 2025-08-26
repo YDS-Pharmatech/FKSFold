@@ -1,0 +1,397 @@
+import logging
+from pathlib import Path
+from typing import Optional
+from collections import defaultdict
+
+import torch
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from Bio.PDB import PDBParser
+
+from chai_lab.data.parsing.structure.residue import ConformerData
+from chai_lab.data.sources.rdkit import RefConformerGenerator
+from chai_lab.data.dataset.structure.all_atom_structure_context import AllAtomStructureContext
+from chai_lab.data.parsing.structure.entity_type import EntityType
+
+logger = logging.getLogger(__name__)
+
+
+def load_pdb_coordinates(
+    pdb_path: Path,
+    structure_context: AllAtomStructureContext,
+    device: torch.device,
+    center_coords: bool = True,
+    add_noise: float = 0.0,
+    target_num_atoms: Optional[int] = None
+) -> Optional[torch.Tensor]:
+    """
+    从PDB文件加载原子坐标并与模型的原子索引对齐，支持chain验证
+    
+    Args:
+        target_num_atoms: 如果提供，将坐标padding到这个原子数量
+    
+    Returns:
+        对齐后的原子坐标张量 [batch_size, num_atoms, 3]，维度与atom_exists_mask匹配
+    """
+    try:
+        # 解析PDB文件
+        parser = PDBParser(QUIET=True)
+        pdb_structure = parser.get_structure("pdb", pdb_path)
+        
+        # 提取PDB中的原子坐标
+        pdb_atoms = {}
+        for model in pdb_structure:
+            for chain in model:
+                chain_id = chain.id
+                for residue in chain:
+                    res_id = residue.id[1]
+                    res_name = residue.resname
+                    
+                    for atom in residue:
+                        atom_name = atom.name
+                        coords = atom.coord
+                        atom_key = (chain_id, res_id, res_name, atom_name)
+                        pdb_atoms[atom_key] = coords
+        
+        # 获取模型期望的原子信息
+        model_atom_names = structure_context.atom_ref_name
+        model_atom_mask = structure_context.atom_exists_mask
+        model_token_indices = structure_context.atom_token_index
+        model_asym_ids = structure_context.token_asym_id
+        model_residue_indices = structure_context.token_residue_index
+        model_entity_types = structure_context.token_entity_type
+        
+        # 获取 structure_context 的实际维度
+        structure_num_atoms = len(model_atom_names)
+        
+        logger.info(f"Structure context num_atoms: {structure_num_atoms}")
+        logger.info(f"model_atom_mask shape: {model_atom_mask.shape}")
+        
+        # 创建asym_id到期望chain字母的映射
+        from chai_lab.data.io.cif_utils import get_chain_letter
+        unique_asym_ids = structure_context.token_asym_id.unique()
+        asym_to_chain_map = {}
+        for asym_id in unique_asym_ids:
+            if asym_id.item() != 0:  # 跳过padding
+                expected_chain = get_chain_letter(asym_id.item())
+                asym_to_chain_map[asym_id.item()] = expected_chain
+        
+        logger.info(f"Expected chain mapping: {asym_to_chain_map}")
+        
+        # 首先创建与 structure_context 维度匹配的坐标张量
+        batch_size = 1
+        structure_coords = torch.zeros(batch_size, structure_num_atoms, 3, device=device)
+        alignment_success = torch.zeros(structure_num_atoms, dtype=torch.bool)
+        
+        # 用于跟踪chain分配统计
+        chain_assignment_stats = defaultdict(lambda: {"correct": 0, "wrong_chain": 0, "not_found": 0})
+        chain_mismatch_details = []
+        
+        # 对齐原子坐标
+        for atom_idx, atom_name in enumerate(model_atom_names):
+            if not model_atom_mask[atom_idx]:
+                continue
+                
+            token_idx = model_token_indices[atom_idx].item()
+            asym_id = model_asym_ids[token_idx].item()
+            residue_idx = model_residue_indices[token_idx].item()
+            entity_type = EntityType(model_entity_types[token_idx].item())
+            
+            # 获取期望的chain字母
+            expected_chain = asym_to_chain_map.get(asym_id, 'A')
+            
+            # 尝试匹配PDB中的原子
+            matched_coords = None
+            matched_chain = None
+            
+            # 蛋白质匹配逻辑 - 优先尝试期望的chain
+            if entity_type == EntityType.PROTEIN:
+                # 首先尝试期望的chain
+                for res_name in ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 
+                               'GLY', 'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 
+                               'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL']:
+                    atom_key = (expected_chain, residue_idx + 1, res_name, atom_name)
+                    if atom_key in pdb_atoms:
+                        matched_coords = pdb_atoms[atom_key]
+                        matched_chain = expected_chain
+                        break
+                
+                # 如果在期望的chain中没找到，尝试其他chain
+                if matched_coords is None:
+                    for chain_id in ['A', 'B', 'C', 'D', 'E', 'F']:
+                        if chain_id == expected_chain:
+                            continue  # 已经尝试过了
+                        for res_name in ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 
+                                       'GLY', 'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 
+                                       'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL']:
+                            atom_key = (chain_id, residue_idx + 1, res_name, atom_name)
+                            if atom_key in pdb_atoms:
+                                matched_coords = pdb_atoms[atom_key]
+                                matched_chain = chain_id
+                                break
+                        if matched_coords is not None:
+                            break
+            
+            # 配体匹配逻辑 - 类似的优先级策略
+            elif entity_type == EntityType.LIGAND:
+                # 首先尝试期望的chain
+                for res_name in ['LIG', 'UNL', 'MOL', 'DRG']:
+                    for res_id_offset in range(-5, 6):
+                        atom_key = (expected_chain, residue_idx + 1 + res_id_offset, res_name, atom_name)
+                        if atom_key in pdb_atoms:
+                            matched_coords = pdb_atoms[atom_key]
+                            matched_chain = expected_chain
+                            break
+                    if matched_coords is not None:
+                        break
+                
+                # 如果在期望的chain中没找到，尝试其他chain
+                if matched_coords is None:
+                    for chain_id in ['A', 'B', 'C', 'D', 'E', 'F', 'L', 'X']:
+                        if chain_id == expected_chain:
+                            continue  # 已经尝试过了
+                        for res_name in ['LIG', 'UNL', 'MOL', 'DRG']:
+                            for res_id_offset in range(-5, 6):
+                                atom_key = (chain_id, residue_idx + 1 + res_id_offset, res_name, atom_name)
+                                if atom_key in pdb_atoms:
+                                    matched_coords = pdb_atoms[atom_key]
+                                    matched_chain = chain_id
+                                    break
+                            if matched_coords is not None:
+                                break
+                        if matched_coords is not None:
+                            break
+                
+                # 如果还没找到，尝试原子名称匹配
+                if matched_coords is None:
+                    for atom_key, coords in pdb_atoms.items():
+                        if atom_key[3] == atom_name:
+                            matched_coords = coords
+                            matched_chain = atom_key[0]
+                            break
+            
+            # 设置匹配的坐标并记录统计
+            if matched_coords is not None:
+                structure_coords[0, atom_idx] = torch.tensor(matched_coords, device=device)
+                alignment_success[atom_idx] = True
+                
+                # 记录chain分配统计
+                if matched_chain == expected_chain:
+                    chain_assignment_stats[asym_id]["correct"] += 1
+                else:
+                    chain_assignment_stats[asym_id]["wrong_chain"] += 1
+                    chain_mismatch_details.append({
+                        "atom_idx": atom_idx,
+                        "atom_name": atom_name,
+                        "asym_id": asym_id,
+                        "residue_idx": residue_idx,
+                        "expected_chain": expected_chain,
+                        "matched_chain": matched_chain,
+                        "entity_type": entity_type.name
+                    })
+            else:
+                chain_assignment_stats[asym_id]["not_found"] += 1
+        
+        # 输出chain分配统计
+        logger.info("=== Chain Assignment Statistics ===")
+        total_correct = 0
+        total_wrong_chain = 0
+        total_not_found = 0
+        
+        for asym_id, stats in chain_assignment_stats.items():
+            expected_chain = asym_to_chain_map.get(asym_id, 'Unknown')
+            logger.info(f"Asym ID {asym_id} (expected chain {expected_chain}):")
+            logger.info(f"  Correct chain: {stats['correct']}")
+            logger.info(f"  Wrong chain: {stats['wrong_chain']}")
+            logger.info(f"  Not found: {stats['not_found']}")
+            
+            total_correct += stats['correct']
+            total_wrong_chain += stats['wrong_chain']
+            total_not_found += stats['not_found']
+        
+        logger.info(f"Total atoms - Correct: {total_correct}, Wrong chain: {total_wrong_chain}, Not found: {total_not_found}")
+        
+        # 如果有chain错误分配，输出详细信息
+        if chain_mismatch_details:
+            logger.warning(f"Found {len(chain_mismatch_details)} atoms assigned to wrong chains:")
+            for detail in chain_mismatch_details[:10]:  # 只显示前10个
+                logger.warning(f"  Atom {detail['atom_name']} (asym {detail['asym_id']}, res {detail['residue_idx']}, {detail['entity_type']}) "
+                             f"expected chain {detail['expected_chain']} but found in chain {detail['matched_chain']}")
+            if len(chain_mismatch_details) > 10:
+                logger.warning(f"  ... and {len(chain_mismatch_details) - 10} more")
+        
+        # 计算总体成功率
+        success_rate = alignment_success.float().mean().item()
+        chain_accuracy = total_correct / (total_correct + total_wrong_chain) if (total_correct + total_wrong_chain) > 0 else 0.0
+        
+        logger.info(f"PDB coordinate alignment success rate: {success_rate:.2%}")
+        logger.info(f"Chain assignment accuracy: {chain_accuracy:.2%}")
+        
+        if success_rate < 0.9:
+            logger.warning(f"PDB coordinate alignment success rate too low: {success_rate:.2%}")
+            return None
+        
+        if chain_accuracy < 0.8:
+            logger.warning(f"Chain assignment accuracy too low: {chain_accuracy:.2%}")
+        
+        # 对于未对齐的原子，使用参考坐标
+        unaligned_mask = ~alignment_success
+        if unaligned_mask.any():
+            ref_coords = structure_context.atom_ref_pos[unaligned_mask]
+            structure_coords[0, unaligned_mask] = ref_coords.to(device)
+            logger.info(f"Used reference coordinates for {unaligned_mask.sum().item()} unaligned atoms")
+        
+        # 居中化坐标
+        if center_coords:
+            valid_mask = model_atom_mask.to(device)
+            if valid_mask.any():
+                center = structure_coords[0, valid_mask].mean(dim=0)
+                structure_coords[0] -= center
+        
+        # 添加噪声
+        if add_noise > 0:
+            noise = add_noise * torch.randn_like(structure_coords)
+            structure_coords += noise
+        
+        # Handle target_num_atoms padding if specified
+        if target_num_atoms is not None and target_num_atoms != structure_coords.shape[1]:
+            logger.info(f"Padding coordinates from {structure_coords.shape[1]} to {target_num_atoms} atoms")
+            
+            batch_size = structure_coords.shape[0]
+            final_coords = torch.zeros(batch_size, target_num_atoms, 3, device=device)
+            
+            # Copy existing coordinates to the beginning
+            current_num_atoms = structure_coords.shape[1]
+            if current_num_atoms <= target_num_atoms:
+                final_coords[:, :current_num_atoms] = structure_coords
+            else:
+                # Truncate if current is larger (shouldn't happen normally)
+                final_coords = structure_coords[:, :target_num_atoms]
+                logger.warning(f"Truncated coordinates from {current_num_atoms} to {target_num_atoms}")
+            
+            structure_coords = final_coords
+        
+        logger.info(f"Returning structure_coords with shape: {structure_coords.shape}")
+        return structure_coords
+        
+    except Exception as e:
+        logger.error(f"Failed to load PDB coordinates from {pdb_path}: {e}")
+        return None
+
+
+def load_ligand_coordinates_from_pdb(
+    pdb_path: Path,
+    ligand_smiles: Optional[str] = None,
+    device: torch.device = torch.device("cuda")
+) -> Optional[torch.Tensor]:
+    """
+    专门从PDB文件中提取配体坐标
+    
+    Args:
+        pdb_path: PDB文件路径
+        ligand_smiles: 配体的SMILES字符串（用于验证）
+        device: 目标设备
+        
+    Returns:
+        配体原子坐标张量，如果失败返回None
+    """
+    try:
+        # 使用RDKit从PDB文件读取分子
+        mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=False)
+        if mol is None:
+            logger.warning(f"Failed to read molecule from PDB file: {pdb_path}")
+            return None
+        
+        # 如果提供了SMILES，验证分子是否匹配
+        if ligand_smiles:
+            ref_mol = Chem.MolFromSmiles(ligand_smiles)
+            if ref_mol is not None:
+                # 简单的分子式比较
+                pdb_formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
+                ref_formula = Chem.rdMolDescriptors.CalcMolFormula(ref_mol)
+                if pdb_formula != ref_formula:
+                    logger.warning(f"Molecular formula mismatch: PDB={pdb_formula}, SMILES={ref_formula}")
+        
+        # 提取坐标
+        conf = mol.GetConformer()
+        coords = []
+        for i in range(mol.GetNumAtoms()):
+            pos = conf.GetAtomPosition(i)
+            coords.append([pos.x, pos.y, pos.z])
+        
+        coords_tensor = torch.tensor(coords, dtype=torch.float32, device=device)
+        
+        # 居中化
+        center = coords_tensor.mean(dim=0)
+        coords_tensor -= center
+        
+        return coords_tensor.unsqueeze(0)  # 添加batch维度
+        
+    except Exception as e:
+        logger.error(f"Failed to load ligand coordinates from {pdb_path}: {e}")
+        return None
+
+def align_pdb_to_smiles(smiles_string, pdb_path):
+    ref_mol = Chem.MolFromSmiles(smiles_string)
+    pdb_mol = Chem.MolFromPDBFile(str(pdb_path))
+    
+    # Use SMILES as template to transfer bond order information to PDB structure
+    aligned_mol = AllChem.AssignBondOrdersFromTemplate(ref_mol, pdb_mol)
+
+    # Ensure hybridization is correct
+    for atom in aligned_mol.GetAtoms():
+        atom.UpdatePropertyCache(strict=False)
+
+    return aligned_mol
+
+
+class PDBConformerGenerator(RefConformerGenerator):
+    def __init__(self, pdb_path: Path):
+        super().__init__()
+        self.pdb_path = pdb_path
+        
+    def generate(self, smiles: str) -> ConformerData:
+        """Generate conformer data from PDB file while maintaining SMILES chemistry"""
+        # Generate molecule from SMILES (same as RefConformerGenerator.generate)
+        mol = Chem.MolFromSmiles(smiles)
+        assert mol is not None, f"Invalid smiles {smiles}"
+
+        mol_with_hs = Chem.AddHs(mol)
+
+        params = AllChem.ETKDGv3()
+        params.useSmallRingTorsions = True
+        params.randomSeed = 123
+        params.useChirality = True
+        params.maxAttempts = 10_000
+        params.useRandomCoords = True
+
+        AllChem.EmbedMultipleConfs(mol_with_hs, numConfs=1, params=params)
+        mol_etkdg = Chem.RemoveHs(mol_with_hs)
+
+        element_counter: dict = defaultdict(int)
+        for atom in mol_etkdg.GetAtoms():
+            elem = atom.GetSymbol()
+            element_counter[elem] += 1
+            atom.SetProp("name", elem + str(element_counter[elem]))
+
+        mol_aligned = align_pdb_to_smiles(smiles, self.pdb_path)
+        
+        if mol_aligned is None:
+            print(f"Warning: Failed to align PDB to SMILES, falling back to ETKDG")
+            retval = self._load_ref_conformer_from_rdkit(mol_etkdg)
+            retval.atom_names = [a.upper() for a in retval.atom_names]
+            return retval
+        
+        # Copy PDB coordinates to ETKDG-generated molecule
+        conf_id = mol_etkdg.AddConformer(Chem.Conformer(mol_etkdg.GetNumAtoms()), assignId=True)
+        conf = mol_etkdg.GetConformer(conf_id)
+        
+        # Copy coordinates from aligned_mol
+        for i in range(mol_etkdg.GetNumAtoms()):
+            pos = mol_aligned.GetConformer().GetAtomPosition(i)
+            conf.SetAtomPosition(i, pos)
+        
+        # Use ETKDG molecule with PDB coordinates
+        retval = self._load_ref_conformer_from_rdkit(mol_etkdg)
+        retval.atom_names = [a.upper() for a in retval.atom_names]
+        return retval
