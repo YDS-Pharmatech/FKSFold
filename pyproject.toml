@@ -21,7 +21,15 @@ path = "chai_lab/__init__.py"
 files = ["requirements.in"]
 [tool.hatch.metadata]
 allow-direct-references = true
+[tool.hatch.build.targets.wheel]
+packages = ["chai_lab", "chai_lab_extension"]
 
+# Optional: include non-code folders in the wheel
+[tool.hatch.build.targets.wheel.force-include]
+"assets" = "assets"
+"examples" = "examples"
+"README.md" = "README.md"
+"LICENSE" = "LICENSE"
 [tool.mypy]
 check_untyped_defs = true
 
@@ -65,10 +73,6 @@ exclude = [
     "/downloads",
     "/outputs",
 ]
-
-[tool.hatch.build.targets.wheel]
-# should use packages from sdist section
-
 [project.scripts]
 chai-lab-fks = "chai_lab.main:cli"
 chai-fks = "chai_lab.main:cli" 
